@@ -1,0 +1,35 @@
+/data/
+
+# dependencies
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+out/
+
+# Expo / React Native
+.expo/
+.expo-shared/
+dist/
+web-build/
+ios/
+android/
+
+# build output
+build/
+coverage/
+.turbo/
+
+# local env
+.env
+.env.*
+!.env.example
+
+# system/editor
+.DS_Store
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
