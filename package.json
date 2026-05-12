@@ -1,0 +1,25 @@
+{
+  "name": "pippa",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.28.1",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "dev:web": "pnpm --filter @pippa/web dev",
+    "dev:mobile": "pnpm --filter @pippa/mobile start",
+    "ios": "pnpm --filter @pippa/mobile ios",
+    "android": "pnpm --filter @pippa/mobile android",
+    "web": "pnpm --filter @pippa/mobile web"
+  },
+  "devDependencies": {
+    "turbo": "^2.8.0",
+    "typescript": "^5.9.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
