@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -51,6 +52,25 @@ UK_COUNTRY_TAGS = frozenset(
 NUMERIC_BARCODE_RE = re.compile(r"^\d{1,14}$")
 IMAGE_FILE_RE = re.compile(r"\.(?:jpg|jpeg|png|webp)$", re.IGNORECASE)
 RESIZED_400_RE = re.compile(r"\.400\.(?:jpg|jpeg|png|webp)$", re.IGNORECASE)
+INVALID_IMAGE_PATH_RE = re.compile(r"/invalid/", re.IGNORECASE)
+
+REQUIRED_CORE_NUTRITION_FIELDS = (
+    "energy_kcal_100g",
+    "proteins_100g",
+    "fat_100g",
+    "carbohydrates_100g",
+)
+
+GRAMS_PER_100G_FIELDS = (
+    "fat_100g",
+    "saturated_fat_100g",
+    "carbohydrates_100g",
+    "sugars_100g",
+    "fiber_100g",
+    "proteins_100g",
+    "salt_100g",
+    "sodium_100g",
+)
 
 BASE_FIELDS = [
     "barcode",
@@ -112,6 +132,12 @@ ASSET_FIELDS = [
     "aws_first_ocr_json_url",
 ]
 
+DERIVED_FIELDS = [
+    "source_content_hash",
+    "data_quality_score",
+    "popularity_score",
+]
+
 
 @dataclass
 class AssetStats:
@@ -127,6 +153,10 @@ class Summary:
     product_rows_seen: int = 0
     uk_rows_seen: int = 0
     invalid_barcode_rows: int = 0
+    filtered_invalid_gtin_rows: int = 0
+    filtered_missing_name_rows: int = 0
+    filtered_missing_core_macro_rows: int = 0
+    filtered_implausible_nutrition_rows: int = 0
     duplicate_barcode_rows: int = 0
     deduped_products: int = 0
     products_with_name: int = 0
@@ -217,6 +247,18 @@ def normalize_barcode(value: str) -> str | None:
     return None
 
 
+def is_valid_gtin(value: str) -> bool:
+    if re.fullmatch(r"\d{8}|\d{12}|\d{13}|\d{14}", value) is None:
+        return False
+
+    digits = [int(ch) for ch in value]
+    check_digit = digits.pop()
+    total = 0
+    for index, digit in enumerate(reversed(digits), start=1):
+        total += digit * (3 if index % 2 == 1 else 1)
+    return (10 - (total % 10)) % 10 == check_digit
+
+
 def split_tags(value: str) -> set[str]:
     return {part.strip() for part in (value or "").split(",") if part.strip()}
 
@@ -239,6 +281,80 @@ def clean_text(value: str) -> str:
     return (value or "").replace("\x00", "").strip()
 
 
+def clean_url(value: str) -> str:
+    url = clean_text(value)
+    if INVALID_IMAGE_PATH_RE.search(url):
+        return ""
+    return url
+
+
+def stable_hash(value: dict[str, object]) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def normalized_tags(value: str) -> str:
+    tags: list[str] = []
+    for part in split_tags(value):
+        text = part.lower().strip()
+        if not text:
+            continue
+        if ":" not in text:
+            text = f"en:{re.sub(r'[^a-z0-9]+', '-', text).strip('-')}"
+        tags.append(text)
+    return ",".join(dict.fromkeys(tags))
+
+
+def has_required_name(product: dict[str, object]) -> bool:
+    return bool(str(product.get("product_name") or "").strip())
+
+
+def has_required_core_macros(product: dict[str, object]) -> bool:
+    return all(product.get(field_name) is not None for field_name in REQUIRED_CORE_NUTRITION_FIELDS)
+
+
+def has_plausible_nutrition(product: dict[str, object]) -> bool:
+    energy_kcal = product.get("energy_kcal_100g")
+    if not isinstance(energy_kcal, (int, float)) or energy_kcal < 0 or energy_kcal > 1000:
+        return False
+
+    energy_kj = product.get("energy_kj_100g")
+    if isinstance(energy_kj, (int, float)) and (energy_kj < 0 or energy_kj > 5000):
+        return False
+
+    macro_total = 0.0
+    for field_name in GRAMS_PER_100G_FIELDS:
+        value = product.get(field_name)
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or value < 0 or value > 100:
+            return False
+        if field_name in ("proteins_100g", "fat_100g", "carbohydrates_100g"):
+            macro_total += float(value)
+
+    return macro_total <= 125
+
+
+def quality_score(product: dict[str, object]) -> int:
+    score = 0
+    score += 30 if has_required_name(product) else 0
+    score += 30 if has_required_core_macros(product) else 0
+    score += 10 if product.get("brands") else 0
+    score += 10 if product.get("serving_quantity") else 0
+    score += 10 if product.get("ingredients_text") else 0
+    score += 10 if product.get("image_url") or product.get("aws_first_image_400_url") else 0
+    return min(score, 100)
+
+
+def popularity_score(product: dict[str, object]) -> int:
+    score = 0
+    score += int(product.get("aws_image_count") or 0)
+    score += int(product.get("aws_ocr_json_count") or 0)
+    score += 5 if product.get("brands") else 0
+    score += 5 if product.get("stores") else 0
+    return score
+
+
 def selected_fields(row: dict[str, str], barcode: str) -> dict[str, object]:
     out: dict[str, object] = {}
     for field_name in BASE_FIELDS:
@@ -246,11 +362,16 @@ def selected_fields(row: dict[str, str], barcode: str) -> dict[str, object]:
             out[field_name] = barcode
         elif field_name == "source_code":
             out[field_name] = clean_text(row.get("code", ""))
+        elif field_name in ("image_url", "image_small_url"):
+            out[field_name] = clean_url(row.get(field_name, ""))
         else:
             out[field_name] = clean_text(row.get(field_name, ""))
 
     for output_name, source_name in NUTRITION_FIELD_MAP.items():
         out[output_name] = as_float(row.get(source_name, ""))
+
+    if not out.get("allergens_tags") and out.get("allergens"):
+        out["allergens_tags"] = normalized_tags(str(out["allergens"]))
 
     search_parts = [
         out.get("product_name"),
@@ -260,6 +381,7 @@ def selected_fields(row: dict[str, str], barcode: str) -> dict[str, object]:
         out.get("ingredients_text"),
     ]
     out["search_text"] = " ".join(str(part) for part in search_parts if part)
+    out["source_content_hash"] = stable_hash(out)
     return out
 
 
@@ -308,8 +430,21 @@ def read_products(path: Path, country_tags: set[str], limit: int) -> tuple[dict[
             if barcode is None:
                 summary.invalid_barcode_rows += 1
                 continue
+            if not is_valid_gtin(barcode):
+                summary.filtered_invalid_gtin_rows += 1
+                continue
 
             product = selected_fields(row, barcode)
+            if not has_required_name(product):
+                summary.filtered_missing_name_rows += 1
+                continue
+            if not has_required_core_macros(product):
+                summary.filtered_missing_core_macro_rows += 1
+                continue
+            if not has_plausible_nutrition(product):
+                summary.filtered_implausible_nutrition_rows += 1
+                continue
+
             existing = products.get(barcode)
             if existing is None:
                 products[barcode] = product
@@ -387,6 +522,8 @@ def with_asset_fields(product: dict[str, object], assets: AssetStats | None) -> 
             "aws_first_ocr_json_url": f"{AWS_BUCKET_URL}{asset.first_ocr_json_key}" if asset.first_ocr_json_key else "",
         }
     )
+    row["data_quality_score"] = quality_score(row)
+    row["popularity_score"] = popularity_score(row)
     return row
 
 
@@ -401,7 +538,7 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, object]]) -> int:
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
-    fields = BASE_FIELDS + list(NUTRITION_FIELD_MAP) + ["search_text"] + ASSET_FIELDS
+    fields = BASE_FIELDS + list(NUTRITION_FIELD_MAP) + ["search_text"] + ASSET_FIELDS + DERIVED_FIELDS
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
