@@ -1,0 +1,1 @@
+ALTER TABLE `food_search_aliases` ADD CONSTRAINT `food_search_aliases_food_locale_alias_uq` UNIQUE(`food_item_id`,`locale`,`alias_sort_key`);

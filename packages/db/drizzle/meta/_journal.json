@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1778606530111,
+      "tag": "0000_cynical_luke_cage",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1778607576832,
+      "tag": "0001_lucky_domino",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1778608163554,
+      "tag": "0002_mysterious_marrow",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1778608285261,
+      "tag": "0003_nostalgic_black_crow",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1778614211107,
+      "tag": "0004_romantic_roland_deschain",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1778615912955,
+      "tag": "0005_nervous_thor_girl",
+      "breakpoints": true
+    }
+  ]
+}

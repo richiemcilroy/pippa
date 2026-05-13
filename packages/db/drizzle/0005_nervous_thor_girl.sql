@@ -1,0 +1,30 @@
+CREATE TABLE `user_food_overrides` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`public_id` varchar(32) NOT NULL,
+	`user_id` bigint unsigned NOT NULL,
+	`food_item_id` bigint unsigned NOT NULL,
+	`display_name` varchar(255),
+	`brand_name` varchar(191),
+	`serving_size_text` varchar(128),
+	`serving_quantity_centi_g` mediumint unsigned,
+	`energy_kcal_100g` smallint unsigned,
+	`energy_kj_100g` smallint unsigned,
+	`protein_100g_centi_g` smallint unsigned,
+	`fibre_100g_centi_g` smallint unsigned,
+	`fat_100g_centi_g` smallint unsigned,
+	`saturated_fat_100g_centi_g` smallint unsigned,
+	`carbs_100g_centi_g` smallint unsigned,
+	`sugars_100g_centi_g` smallint unsigned,
+	`salt_100g_mg` mediumint unsigned,
+	`sodium_100g_mg` mediumint unsigned,
+	`edit_count` int unsigned NOT NULL DEFAULT 1,
+	`last_meal_log_item_id` bigint unsigned,
+	`last_edited_at` datetime(3) NOT NULL,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	`updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `user_food_overrides_id` PRIMARY KEY(`id`),
+	CONSTRAINT `user_food_overrides_public_id_uq` UNIQUE(`public_id`),
+	CONSTRAINT `user_food_overrides_user_food_uq` UNIQUE(`user_id`,`food_item_id`)
+);
+--> statement-breakpoint
+CREATE INDEX `user_food_overrides_user_recent_idx` ON `user_food_overrides` (`user_id`,`last_edited_at`);
