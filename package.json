@@ -2,17 +2,19 @@
   "name": "pippa",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "pnpm@10.28.1",
+  "packageManager": "bun@1.3.6",
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
     "lint": "turbo lint",
     "typecheck": "turbo typecheck",
-    "dev:web": "pnpm --filter @pippa/web dev",
-    "dev:mobile": "pnpm --filter @pippa/mobile start",
-    "ios": "pnpm --filter @pippa/mobile ios",
-    "android": "pnpm --filter @pippa/mobile android",
-    "web": "pnpm --filter @pippa/mobile web"
+    "db:generate": "bun --filter @pippa/db generate",
+    "db:migrate": "bun --filter @pippa/db migrate",
+    "dev:web": "bun --filter @pippa/web dev",
+    "dev:mobile": "bun --filter @pippa/mobile start",
+    "ios": "bun --filter @pippa/mobile ios",
+    "android": "bun --filter @pippa/mobile android",
+    "web": "bun --filter @pippa/mobile web"
   },
   "devDependencies": {
     "turbo": "^2.8.0",
