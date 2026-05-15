@@ -12,6 +12,7 @@ Production should keep the Vercel app and PlanetScale database in `eu-west-2`, a
 - Keep hot nutrition columns on `food_items`. Food search, barcode lookup, and log creation nearly always need calories, protein, fibre, fat, and serving information.
 - Move wide/rare fields into side tables: ingredients, labels, allergens, raw import payloads, OCR, and assets live outside the hot food row. `food_item_raw_sources` is intentionally separate from `food_item_details` so normal detail views do not pull source JSON.
 - Track repeatable public-food imports with `food_import_batches`, `source_content_hash`, `source_last_seen_at`, and `source_deleted_at` so source refreshes can update, mark stale, or audit rows without destructive one-off loads.
+- Keep one canonical public `food_items` row per cleaned product and store alternate Open Food Facts barcodes/source IDs in `food_item_source_refs`. This keeps search results deduped while preserving exact barcode/source lookups.
 - Store market availability in `food_item_markets` instead of querying country JSON for hot filters.
 - Store user-selectable/default portions in `food_item_servings`; keep the simple serving fields on `food_items` for barcode/logging fast paths.
 - Store per-user corrections in `user_food_overrides` instead of mutating public food rows. When a user edits calories, protein, fibre, fat, carbs, serving text, or brand/name for a public food, service code should resolve the public row plus that user's override before displaying or logging it.
@@ -22,7 +23,7 @@ Production should keep the Vercel app and PlanetScale database in `eu-west-2`, a
 ## Hot Query Paths
 
 - Session: `session.token` unique lookup, then Drizzle relation to `user`.
-- Barcode: `food_items.barcode` unique lookup.
+- Barcode: try `food_items.barcode` for the canonical row, then `food_item_source_refs(source_kind, barcode)` to resolve duplicate/source barcodes to the canonical `food_item_id`.
 - Search: visibility-scoped active-food prefix indexes on normalized names plus a manual MySQL `FULLTEXT` index for `food_items`. Public food search should include `visibility = 'public'` and `source_deleted_at IS NULL`.
 - Alias search: `food_search_aliases(locale, alias_sort_key, weight)` first, then join to active/public `food_items` by ID.
 - Private/user food search: `food_items(owner_user_id, name_sort_key, brand_sort_key)`.
@@ -43,6 +44,7 @@ The UK local dataset builder intentionally drops rows before database import whe
 - Product must have core macro data: kcal, protein, fat, and carbohydrates per 100g. Fibre remains important to Pippa but is optional in OFF because coverage is materially lower.
 - Per-100g nutrition must be plausible. The builder rejects negative values, values above 100g per 100g for gram-based nutrients, kcal above 1000 per 100g, kJ above 5000 per 100g, and obviously impossible macro totals.
 - Open Food Facts placeholder image URLs under `/invalid/` are cleared rather than imported as usable product images.
+- Product names, brands, and categories are cleaned before import. Rows with the same cleaned brand/name/category are collapsed into one canonical food item, with duplicate source rows retained in `food_item_source_refs`.
 
 ## Better Auth
 
@@ -81,10 +83,23 @@ Drizzle Kit does not currently model MySQL full-text indexes well enough for thi
 
 Barcode lookup should never use text search. For typed search:
 
-1. Try exact barcode if the query is numeric.
+1. Try exact barcode if the query is numeric, including `food_item_source_refs` fallback for duplicate/source barcodes.
 2. Query `food_items` prefix and `food_search_aliases` for autocomplete.
 3. Use `MATCH ... AGAINST` on the full-text index for multi-word queries.
 4. Rank by text score, `data_quality_score`, and `popularity_score`.
+
+## MyFitnessPal Import
+
+The MyFitnessPal corpus is curated before it is written to `food_items`.
+
+```sh
+bun --filter @pippa/db import:myfitnesspal
+bun --filter @pippa/db import:myfitnesspal -- --apply
+```
+
+The dry run writes ignored CSV/JSON outputs under `data/myfitnesspal/production-corpus`. The importer promotes only public, non-deleted, mass-serving rows whose default serving can be converted to per-100g nutrition, rejects upstream quality warnings by default, quarantines obvious profanity/test/joke rows, collapses soft duplicates by cleaned brand/name/category or valid barcode, writes source refs for duplicate IDs, and generates `food_search_aliases` for UK spelling, brand, and synonym variants.
+
+MyFitnessPal barcodes are stored in `food_item_source_refs`, not directly on `food_items`, so they cannot overwrite canonical Open Food Facts barcode rows if both sources contain the same GTIN.
 
 ## Commands
 
