@@ -27,6 +27,7 @@ export type TargetCalculationReason = (typeof targetCalculationReasons)[number];
 
 export const foodSourceKinds = [
   "open_food_facts",
+  "myfitnesspal",
   "pippa_curated",
   "user_created",
   "ai_photo",

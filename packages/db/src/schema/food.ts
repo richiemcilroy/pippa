@@ -145,6 +145,33 @@ export const foodItemDetails = mysqlTable(
   ],
 );
 
+export const foodItemSourceRefs = mysqlTable(
+  "food_item_source_refs",
+  {
+    id: idColumn(),
+    foodItemId: refIdColumn("food_item_id"),
+    sourceKind: varchar("source_kind", { length: 32 }).$type<FoodSourceKind>().notNull(),
+    sourceExternalId: varchar("source_external_id", { length: 191 }).notNull(),
+    barcode: varchar("barcode", { length: 14 }),
+    sourceImportBatchId: nullableRefIdColumn("source_import_batch_id"),
+    canonicalSourceExternalId: varchar("canonical_source_external_id", { length: 191 }).notNull(),
+    canonicalBarcode: varchar("canonical_barcode", { length: 14 }),
+    duplicateGroupKey: varchar("duplicate_group_key", { length: 191 }),
+    duplicateReason: varchar("duplicate_reason", { length: 64 }),
+    isCanonical: tinyint("is_canonical", { unsigned: true }).notNull().default(0),
+    sourceContentHash: varchar("source_content_hash", { length: 64 }),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("food_item_source_refs_source_external_uq").on(table.sourceKind, table.sourceExternalId),
+    uniqueIndex("food_item_source_refs_source_barcode_uq").on(table.sourceKind, table.barcode),
+    index("food_item_source_refs_food_idx").on(table.foodItemId),
+    index("food_item_source_refs_canonical_idx").on(table.sourceKind, table.canonicalSourceExternalId),
+    index("food_item_source_refs_import_batch_idx").on(table.sourceImportBatchId),
+  ],
+);
+
 export const foodItemRawSources = mysqlTable(
   "food_item_raw_sources",
   {
@@ -322,6 +349,7 @@ export const foodItemRelations = relations(foodItems, ({ one, many }) => ({
     fields: [foodItems.id],
     references: [foodItemDetails.foodItemId],
   }),
+  sourceRefs: many(foodItemSourceRefs),
   rawSource: one(foodItemRawSources, {
     fields: [foodItems.id],
     references: [foodItemRawSources.foodItemId],
@@ -345,6 +373,17 @@ export const foodItemDetailRelations = relations(foodItemDetails, ({ one }) => (
   foodItem: one(foodItems, {
     fields: [foodItemDetails.foodItemId],
     references: [foodItems.id],
+  }),
+}));
+
+export const foodItemSourceRefRelations = relations(foodItemSourceRefs, ({ one }) => ({
+  foodItem: one(foodItems, {
+    fields: [foodItemSourceRefs.foodItemId],
+    references: [foodItems.id],
+  }),
+  importBatch: one(foodImportBatches, {
+    fields: [foodItemSourceRefs.sourceImportBatchId],
+    references: [foodImportBatches.id],
   }),
 }));
 
