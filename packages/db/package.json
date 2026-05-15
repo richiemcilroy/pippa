@@ -12,9 +12,11 @@
     "migrate": "drizzle-kit migrate --config drizzle.config.ts",
     "studio": "drizzle-kit studio --config drizzle.config.ts",
     "import:openfoodfacts:uk": "bun scripts/import-openfoodfacts-uk.ts",
+    "import:myfitnesspal": "bun scripts/import-myfitnesspal-production.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@pippa/domain": "workspace:*",
     "@planetscale/database": "^1.19.0",
     "drizzle-orm": "^0.45.0"
   },
