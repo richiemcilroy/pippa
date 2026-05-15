@@ -1,9 +1,10 @@
 import { connect } from "@planetscale/database";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { cleanCategoryName, cleanFoodBrand, cleanFoodName, foodDedupeKey, foodTextKey } from "@pippa/domain/food-display";
 
 type ProductRow = Record<string, unknown>;
 type DatabaseConnection = ReturnType<typeof connect>;
@@ -11,11 +12,35 @@ type SanitizedProduct = NonNullable<ReturnType<typeof sanitizedProduct>>;
 type ImportRecord = {
   row: ProductRow;
   product: SanitizedProduct;
+  canonicalSourceExternalId: string;
+  duplicateGroupKey: string;
+  isCanonical: boolean;
+  duplicateReason: string | null;
+};
+type PendingImportRecord = {
+  row: ProductRow;
+  product: SanitizedProduct;
+};
+type CanonicalGroup = {
+  duplicateGroupKey: string;
+  canonical: PendingImportRecord;
+  records: ImportRecord[];
+};
+type SourceRefRecord = {
+  sourceExternalId: string;
+  barcode: string | null;
+  canonicalSourceExternalId: string;
+  canonicalBarcode: string | null;
+  duplicateGroupKey: string;
+  isCanonical: boolean;
+  duplicateReason: string | null;
+  sourceContentHash: string | null;
 };
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(SCRIPT_DIR, "../../..");
 const DEFAULT_INPUT = resolve(PROJECT_ROOT, "data/openfoodfacts/uk/products.jsonl");
+const DEFAULT_SOURCE_REFS_INPUT = resolve(PROJECT_ROOT, "data/openfoodfacts/uk/source_refs.jsonl");
 const SOURCE_KIND = "open_food_facts";
 const LOCALE = "en-GB";
 const UK_TAG_TO_COUNTRY = new Map([
@@ -86,13 +111,7 @@ function decodeHtml(value: string) {
 }
 
 function sortKey(value: unknown, maxLength = 191) {
-  return text(value)
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
-    .trim()
-    .slice(0, maxLength);
+  return foodTextKey(value, maxLength);
 }
 
 function numberValue(value: unknown) {
@@ -186,6 +205,12 @@ function hasPlausibleNutrition(row: ProductRow) {
   if (kj !== null && (kj < 0 || kj > 5000)) {
     return false;
   }
+  if (kj !== null) {
+    const kcalFromKj = kj / 4.184;
+    if (Math.abs(kcal - kcalFromKj) > Math.max(35, kcalFromKj * 0.25)) {
+      return false;
+    }
+  }
   const gramFields = [
     "fat_100g",
     "saturated_fat_100g",
@@ -218,12 +243,15 @@ function hasPlausibleNutrition(row: ProductRow) {
 }
 
 function sanitizedProduct(row: ProductRow) {
-  const barcode = text(row.barcode, 14);
-  const name = text(row.product_name, 255);
+  const barcode = nullableText(row.barcode, 14);
+  const brandName = cleanFoodBrand(row.brands);
+  const categoryName = cleanCategoryName(row.main_category_en ?? row.categories);
+  const name = text(cleanFoodName(row.product_name, { brandName, fallbackName: row.generic_name, categoryName }), 255);
   const nameKey = sortKey(name);
   const sourceExternalId = text(row.source_code || row.barcode, 191);
+  const gtinValid = text(row.gtin_valid) === "1" || (barcode ? validGtin(barcode) : false);
 
-  if (!barcode || !validGtin(barcode) || !name || !nameKey || !sourceExternalId) {
+  if (!name || !nameKey || !sourceExternalId) {
     return null;
   }
   if (
@@ -238,14 +266,15 @@ function sanitizedProduct(row: ProductRow) {
 
   return {
     barcode,
+    gtinValid: gtinValid ? 1 : 0,
     sourceExternalId,
     publicId: makePublicId("food", `${SOURCE_KIND}:${sourceExternalId}`),
     sourceContentHash: nullableText(row.source_content_hash, 64) ?? hash(JSON.stringify(row)),
     name,
-    brandName: nullableText(row.brands, 191),
+    brandName: nullableText(brandName, 191),
     nameSortKey: nameKey,
-    brandSortKey: nullableText(sortKey(row.brands), 191),
-    searchText: text([row.product_name, row.generic_name, row.brands, row.categories, row.ingredients_text].join(" ")),
+    brandSortKey: nullableText(sortKey(brandName), 191),
+    searchText: text([name, row.product_name, row.generic_name, brandName, row.brands, row.categories, row.ingredients_text].join(" ")),
     quantityText: nullableText(row.quantity, 128),
     servingSizeText: nullableText(row.serving_size, 128),
     servingQuantityCentiG: centiG(row.serving_quantity),
@@ -267,6 +296,82 @@ function sanitizedProduct(row: ProductRow) {
     sourceUpdatedAtEpoch: intValue(row.last_modified_t),
     sourceLastSeenAt: mysqlDatetime(new Date()),
   };
+}
+
+function canonicalGroupKey(record: PendingImportRecord) {
+  return foodDedupeKey({
+    source: SOURCE_KIND,
+    name: record.product.name,
+    brand: record.product.brandName,
+    category: record.row.main_category_en ?? record.row.categories,
+  });
+}
+
+function canonicalScore(record: PendingImportRecord) {
+  const row = record.row;
+  const product = record.product;
+  let score = product.dataQualityScore * 100 + product.popularityScore;
+  score += product.imageUrl || product.imageSmallUrl ? 35 : 0;
+  score += product.servingQuantityCentiG ? 25 : 0;
+  score += product.packageQuantityCentiG ? 10 : 0;
+  score += nullableText(row.ingredients_text) ? 25 : 0;
+  score += nullableText(row.stores) ? 10 : 0;
+  score += product.sourceUpdatedAtEpoch ? Math.min(product.sourceUpdatedAtEpoch / 100_000_000, 20) : 0;
+  return score;
+}
+
+function canonicalGroups(records: PendingImportRecord[]) {
+  const groupsByKey = new Map<string, PendingImportRecord[]>();
+  for (const record of records) {
+    const key = canonicalGroupKey(record);
+    groupsByKey.set(key, [...(groupsByKey.get(key) ?? []), record]);
+  }
+
+  const groups: CanonicalGroup[] = [];
+  for (const [duplicateGroupKey, groupRecords] of groupsByKey) {
+    const canonical = [...groupRecords].sort(
+      (a, b) => canonicalScore(b) - canonicalScore(a) || a.product.sourceExternalId.localeCompare(b.product.sourceExternalId),
+    )[0];
+    if (!canonical) {
+      continue;
+    }
+
+    groups.push({
+      duplicateGroupKey,
+      canonical,
+      records: groupRecords.map((record) => ({
+        ...record,
+        canonicalSourceExternalId: canonical.product.sourceExternalId,
+        duplicateGroupKey,
+        isCanonical: record.product.sourceExternalId === canonical.product.sourceExternalId,
+        duplicateReason: record.product.sourceExternalId === canonical.product.sourceExternalId ? null : "same_clean_brand_name",
+      })),
+    });
+  }
+
+  return groups.sort((a, b) => a.canonical.product.sourceExternalId.localeCompare(b.canonical.product.sourceExternalId));
+}
+
+function groupChunks(groups: CanonicalGroup[], maxRecords: number) {
+  const chunks: CanonicalGroup[][] = [];
+  let current: CanonicalGroup[] = [];
+  let currentSize = 0;
+
+  for (const group of groups) {
+    if (current.length > 0 && currentSize + group.records.length > maxRecords) {
+      chunks.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(group);
+    currentSize += group.records.length;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks;
 }
 
 async function insertImportBatch(conn: DatabaseConnection, input: string, limit: number) {
@@ -298,7 +403,7 @@ async function upsertFoodItem(conn: DatabaseConnection, product: SanitizedProduc
        fibre_100g_centi_g, fat_100g_centi_g, saturated_fat_100g_centi_g, carbs_100g_centi_g, sugars_100g_centi_g,
        salt_100g_mg, sodium_100g_mg, image_url, image_small_url, data_quality_score, popularity_score,
        source_updated_at_epoch, source_last_seen_at, source_deleted_at)
-     values (?, ?, ?, ?, ?, 'public', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null)
+     values (?, ?, ?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null)
      on duplicate key update
        source_import_batch_id = values(source_import_batch_id),
        source_content_hash = values(source_content_hash),
@@ -336,6 +441,7 @@ async function upsertFoodItem(conn: DatabaseConnection, product: SanitizedProduc
       batchId,
       product.sourceContentHash,
       product.barcode,
+      product.gtinValid,
       product.name,
       product.brandName,
       product.nameSortKey,
@@ -506,9 +612,9 @@ async function upsertAsset(
 }
 
 async function upsertAssets(conn: DatabaseConnection, foodItemId: number, row: ProductRow) {
-  const barcode = text(row.barcode, 14);
-  await upsertAsset(conn, foodItemId, "front", row.image_url, `off:${barcode}:front`);
-  await upsertAsset(conn, foodItemId, "front_small", row.image_small_url, `off:${barcode}:front_small`);
+  const sourceKey = text(row.barcode || row.source_code, 191);
+  await upsertAsset(conn, foodItemId, "front", row.image_url, `off:${sourceKey}:front`);
+  await upsertAsset(conn, foodItemId, "front_small", row.image_small_url, `off:${sourceKey}:front_small`);
   await upsertAsset(conn, foodItemId, "aws_400", row.aws_first_image_400_url, nullableText(row.aws_first_image_400_key, 512));
   await upsertAsset(conn, foodItemId, "ocr_json", row.aws_first_ocr_json_url, nullableText(row.aws_first_ocr_json_key, 512));
 }
@@ -530,10 +636,16 @@ async function upsertAlias(conn: DatabaseConnection, foodItemId: number, alias: 
 }
 
 async function upsertAliases(conn: DatabaseConnection, foodItemId: number, row: ProductRow) {
+  const brandName = cleanFoodBrand(row.brands);
+  const categoryName = cleanCategoryName(row.main_category_en ?? row.categories);
+  const name = cleanFoodName(row.product_name, { brandName, fallbackName: row.generic_name, categoryName });
+  await upsertAlias(conn, foodItemId, name, 12);
   await upsertAlias(conn, foodItemId, row.product_name, 10);
   await upsertAlias(conn, foodItemId, row.generic_name, 6);
-  await upsertAlias(conn, foodItemId, row.brands, 4);
-  await upsertAlias(conn, foodItemId, [row.brands, row.product_name].filter(Boolean).join(" "), 8);
+  await upsertAlias(conn, foodItemId, brandName, 4);
+  await upsertAlias(conn, foodItemId, row.brands, 3);
+  await upsertAlias(conn, foodItemId, [brandName, name].filter(Boolean).join(" "), 9);
+  await upsertAlias(conn, foodItemId, [row.brands, row.product_name].filter(Boolean).join(" "), 7);
 }
 
 async function upsertFoodItemsBatch(conn: DatabaseConnection, records: ImportRecord[], batchId: number) {
@@ -581,7 +693,7 @@ async function upsertFoodItemsBatch(conn: DatabaseConnection, records: ImportRec
     product.sourceContentHash,
     "public",
     product.barcode,
-    1,
+    product.gtinValid,
     product.name,
     product.brandName,
     product.nameSortKey,
@@ -648,6 +760,13 @@ async function upsertFoodItemsBatch(conn: DatabaseConnection, records: ImportRec
 
 async function foodItemIdsForRecords(conn: DatabaseConnection, records: ImportRecord[]) {
   const externalIds = records.map(({ product }) => product.sourceExternalId);
+  return foodItemIdsForExternalIds(conn, externalIds);
+}
+
+async function foodItemIdsForExternalIds(conn: DatabaseConnection, externalIds: string[]) {
+  if (externalIds.length === 0) {
+    return new Map<string, number>();
+  }
   const result = await conn.execute(
     `select id, source_external_id from food_items where source_kind = ? and source_external_id in (${externalIds
       .map(() => "?")
@@ -659,6 +778,167 @@ async function foodItemIdsForRecords(conn: DatabaseConnection, records: ImportRe
     ids.set(String(valueOf(row, "source_external_id")), Number(valueOf(row, "id")));
   }
   return ids;
+}
+
+async function upsertSourceRefsBatch(conn: DatabaseConnection, records: ImportRecord[], ids: Map<string, number>, batchId: number) {
+  const canonicalByExternalId = new Map(records.filter((record) => record.isCanonical).map((record) => [record.product.sourceExternalId, record]));
+  const rows: unknown[][] = [];
+
+  for (const { product, canonicalSourceExternalId, duplicateGroupKey, isCanonical, duplicateReason } of records) {
+    const foodItemId = ids.get(canonicalSourceExternalId);
+    const canonical = canonicalByExternalId.get(canonicalSourceExternalId);
+    if (!foodItemId || !canonical) {
+      continue;
+    }
+
+    rows.push([
+      foodItemId,
+      SOURCE_KIND,
+      product.sourceExternalId,
+      product.barcode,
+      batchId,
+      canonicalSourceExternalId,
+      canonical.product.barcode,
+      duplicateGroupKey.slice(0, 191),
+      duplicateReason,
+      isCanonical ? 1 : 0,
+      product.sourceContentHash,
+    ]);
+  }
+
+  await executeBulk(
+    conn,
+    "food_item_source_refs",
+    [
+      "food_item_id",
+      "source_kind",
+      "source_external_id",
+      "barcode",
+      "source_import_batch_id",
+      "canonical_source_external_id",
+      "canonical_barcode",
+      "duplicate_group_key",
+      "duplicate_reason",
+      "is_canonical",
+      "source_content_hash",
+    ],
+    rows,
+    `on duplicate key update
+       food_item_id = values(food_item_id),
+       source_import_batch_id = values(source_import_batch_id),
+       canonical_source_external_id = values(canonical_source_external_id),
+       canonical_barcode = values(canonical_barcode),
+       duplicate_group_key = values(duplicate_group_key),
+       duplicate_reason = values(duplicate_reason),
+       is_canonical = values(is_canonical),
+       source_content_hash = values(source_content_hash)`,
+  );
+}
+
+async function markDuplicateFoodItemsBatch(conn: DatabaseConnection, records: ImportRecord[]) {
+  const duplicateExternalIds = records
+    .filter((record) => !record.isCanonical)
+    .map((record) => record.product.sourceExternalId);
+
+  for (const chunk of chunked(duplicateExternalIds, 100)) {
+    await conn.execute(
+      `update food_items
+       set source_deleted_at = ?
+       where source_kind = ? and source_external_id in (${chunk.map(() => "?").join(", ")})`,
+      [mysqlDatetime(new Date()), SOURCE_KIND, ...chunk],
+    );
+  }
+}
+
+function sourceRefRecord(row: ProductRow): SourceRefRecord | null {
+  const sourceExternalId = text(row.source_code, 191);
+  const barcode = nullableText(row.barcode, 14);
+  const canonicalSourceExternalId = text(row.canonical_source_code, 191);
+  const canonicalBarcode = nullableText(row.canonical_barcode, 14);
+
+  if (!sourceExternalId || !canonicalSourceExternalId) {
+    return null;
+  }
+
+  return {
+    sourceExternalId,
+    barcode,
+    canonicalSourceExternalId,
+    canonicalBarcode,
+    duplicateGroupKey: text(row.canonical_group_key, 191),
+    isCanonical: text(row.is_canonical) === "1" || row.is_canonical === 1 || row.is_canonical === true,
+    duplicateReason: nullableText(row.duplicate_reason, 64),
+    sourceContentHash: nullableText(row.source_content_hash, 64),
+  };
+}
+
+async function upsertSourceRefRowsBatch(conn: DatabaseConnection, records: SourceRefRecord[], batchId: number) {
+  const ids = await foodItemIdsForExternalIds(conn, [...new Set(records.map((record) => record.canonicalSourceExternalId))]);
+  const rows: unknown[][] = [];
+
+  for (const record of records) {
+    const foodItemId = ids.get(record.canonicalSourceExternalId);
+    if (!foodItemId) {
+      continue;
+    }
+    rows.push([
+      foodItemId,
+      SOURCE_KIND,
+      record.sourceExternalId,
+      record.barcode,
+      batchId,
+      record.canonicalSourceExternalId,
+      record.canonicalBarcode,
+      record.duplicateGroupKey,
+      record.duplicateReason,
+      record.isCanonical ? 1 : 0,
+      record.sourceContentHash,
+    ]);
+  }
+
+  await executeBulk(
+    conn,
+    "food_item_source_refs",
+    [
+      "food_item_id",
+      "source_kind",
+      "source_external_id",
+      "barcode",
+      "source_import_batch_id",
+      "canonical_source_external_id",
+      "canonical_barcode",
+      "duplicate_group_key",
+      "duplicate_reason",
+      "is_canonical",
+      "source_content_hash",
+    ],
+    rows,
+    `on duplicate key update
+       food_item_id = values(food_item_id),
+       source_import_batch_id = values(source_import_batch_id),
+       canonical_source_external_id = values(canonical_source_external_id),
+       canonical_barcode = values(canonical_barcode),
+       duplicate_group_key = values(duplicate_group_key),
+       duplicate_reason = values(duplicate_reason),
+       is_canonical = values(is_canonical),
+       source_content_hash = values(source_content_hash)`,
+  );
+  return rows.length;
+}
+
+async function markDuplicateSourceRefRowsBatch(conn: DatabaseConnection, records: SourceRefRecord[]) {
+  const duplicateExternalIds = records
+    .filter((record) => !record.isCanonical)
+    .map((record) => record.sourceExternalId);
+
+  for (const chunk of chunked(duplicateExternalIds, 100)) {
+    await conn.execute(
+      `update food_items
+       set source_deleted_at = ?
+       where source_kind = ? and source_external_id in (${chunk.map(() => "?").join(", ")})`,
+      [mysqlDatetime(new Date()), SOURCE_KIND, ...chunk],
+    );
+  }
 }
 
 async function executeBulk(
@@ -694,8 +974,8 @@ async function upsertDetailsBatch(conn: DatabaseConnection, records: ImportRecor
     "source_url",
   ];
   const rows: unknown[][] = [];
-  for (const { row, product } of records) {
-    const foodItemId = ids.get(product.sourceExternalId);
+  for (const { row, canonicalSourceExternalId } of records) {
+    const foodItemId = ids.get(canonicalSourceExternalId);
     if (!foodItemId) {
       continue;
     }
@@ -738,8 +1018,8 @@ async function upsertDetailsBatch(conn: DatabaseConnection, records: ImportRecor
 
 async function upsertRawSourcesBatch(conn: DatabaseConnection, records: ImportRecord[], ids: Map<string, number>) {
   const rows: unknown[][] = [];
-  for (const { row, product } of records) {
-    const foodItemId = ids.get(product.sourceExternalId);
+  for (const { row, canonicalSourceExternalId } of records) {
+    const foodItemId = ids.get(canonicalSourceExternalId);
     if (!foodItemId) {
       continue;
     }
@@ -759,8 +1039,8 @@ async function upsertRawSourcesBatch(conn: DatabaseConnection, records: ImportRe
 
 async function upsertMarketsBatch(conn: DatabaseConnection, records: ImportRecord[], ids: Map<string, number>) {
   const rows: unknown[][] = [];
-  for (const { row, product } of records) {
-    const foodItemId = ids.get(product.sourceExternalId);
+  for (const { row, canonicalSourceExternalId } of records) {
+    const foodItemId = ids.get(canonicalSourceExternalId);
     if (!foodItemId) {
       continue;
     }
@@ -817,8 +1097,8 @@ function servingRowsForRecord(foodItemId: number, row: ProductRow) {
 }
 
 async function upsertServingsBatch(conn: DatabaseConnection, records: ImportRecord[], ids: Map<string, number>) {
-  const rows = records.flatMap(({ row, product }) => {
-    const foodItemId = ids.get(product.sourceExternalId);
+  const rows = records.flatMap(({ row, canonicalSourceExternalId }) => {
+    const foodItemId = ids.get(canonicalSourceExternalId);
     return foodItemId ? servingRowsForRecord(foodItemId, row) : [];
   });
   await executeBulk(
@@ -835,15 +1115,15 @@ async function upsertServingsBatch(conn: DatabaseConnection, records: ImportReco
 
 async function upsertAssetsBatch(conn: DatabaseConnection, records: ImportRecord[], ids: Map<string, number>) {
   const rows: unknown[][] = [];
-  for (const { row, product } of records) {
-    const foodItemId = ids.get(product.sourceExternalId);
+  for (const { row, canonicalSourceExternalId } of records) {
+    const foodItemId = ids.get(canonicalSourceExternalId);
     if (!foodItemId) {
       continue;
     }
-    const barcode = text(row.barcode, 14);
+    const sourceKey = text(row.barcode || row.source_code, 191);
     const assets = [
-      ["front", row.image_url, `off:${barcode}:front`],
-      ["front_small", row.image_small_url, `off:${barcode}:front_small`],
+      ["front", row.image_url, `off:${sourceKey}:front`],
+      ["front_small", row.image_small_url, `off:${sourceKey}:front_small`],
       ["aws_400", row.aws_first_image_400_url, nullableText(row.aws_first_image_400_key, 512)],
       ["ocr_json", row.aws_first_ocr_json_url, nullableText(row.aws_first_ocr_json_key, 512)],
     ] as const;
@@ -868,16 +1148,19 @@ async function upsertAssetsBatch(conn: DatabaseConnection, records: ImportRecord
 
 async function upsertAliasesBatch(conn: DatabaseConnection, records: ImportRecord[], ids: Map<string, number>) {
   const byKey = new Map<string, unknown[]>();
-  for (const { row, product } of records) {
-    const foodItemId = ids.get(product.sourceExternalId);
+  for (const { row, product, canonicalSourceExternalId } of records) {
+    const foodItemId = ids.get(canonicalSourceExternalId);
     if (!foodItemId) {
       continue;
     }
     const aliases: Array<[unknown, number]> = [
+      [product.name, 12],
       [row.product_name, 10],
       [row.generic_name, 6],
-      [row.brands, 4],
-      [[row.brands, row.product_name].filter(Boolean).join(" "), 8],
+      [product.brandName, 4],
+      [row.brands, 3],
+      [[product.brandName, product.name].filter(Boolean).join(" "), 9],
+      [[row.brands, row.product_name].filter(Boolean).join(" "), 7],
     ];
     for (const [alias, weight] of aliases) {
       const aliasText = nullableText(alias, 255);
@@ -900,18 +1183,59 @@ async function upsertAliasesBatch(conn: DatabaseConnection, records: ImportRecor
 }
 
 async function importBatch(conn: DatabaseConnection, records: ImportRecord[], batchId: number) {
-  await upsertFoodItemsBatch(conn, records, batchId);
-  const ids = await foodItemIdsForRecords(conn, records);
-  await upsertDetailsBatch(conn, records, ids);
-  await upsertRawSourcesBatch(conn, records, ids);
+  const canonicalRecords = records.filter((record) => record.isCanonical);
+  await upsertFoodItemsBatch(conn, canonicalRecords, batchId);
+  const ids = await foodItemIdsForRecords(conn, canonicalRecords);
+  await upsertSourceRefsBatch(conn, records, ids, batchId);
+  await markDuplicateFoodItemsBatch(conn, records);
+  await upsertDetailsBatch(conn, canonicalRecords, ids);
+  await upsertRawSourcesBatch(conn, canonicalRecords, ids);
   await upsertMarketsBatch(conn, records, ids);
   await upsertServingsBatch(conn, records, ids);
   await upsertAssetsBatch(conn, records, ids);
   await upsertAliasesBatch(conn, records, ids);
 }
 
+async function importSourceRefs(conn: DatabaseConnection, input: string, batchId: number, batchSize: number) {
+  if (!existsSync(input)) {
+    return { seen: 0, imported: 0, skipped: 0 };
+  }
+
+  const reader = createInterface({ input: createReadStream(input), crlfDelay: Infinity });
+  let seen = 0;
+  let imported = 0;
+  let skipped = 0;
+  const pending: SourceRefRecord[] = [];
+
+  for await (const line of reader) {
+    if (!line.trim()) {
+      continue;
+    }
+    seen += 1;
+    const record = sourceRefRecord(JSON.parse(line) as ProductRow);
+    if (!record) {
+      skipped += 1;
+      continue;
+    }
+    pending.push(record);
+    if (pending.length >= batchSize) {
+      imported += await upsertSourceRefRowsBatch(conn, pending, batchId);
+      await markDuplicateSourceRefRowsBatch(conn, pending);
+      pending.length = 0;
+    }
+  }
+
+  if (pending.length > 0) {
+    imported += await upsertSourceRefRowsBatch(conn, pending, batchId);
+    await markDuplicateSourceRefRowsBatch(conn, pending);
+  }
+
+  return { seen, imported, skipped };
+}
+
 async function importRows() {
   const input = resolve(PROJECT_ROOT, argValue("--input", DEFAULT_INPUT));
+  const sourceRefsInput = resolve(PROJECT_ROOT, argValue("--source-refs-input", DEFAULT_SOURCE_REFS_INPUT));
   const limit = flagNumber("--limit", 100);
   const batchSize = Math.max(1, flagNumber("--batch-size", 100));
   const progressInterval = Math.max(batchSize, flagNumber("--progress-interval", 1000));
@@ -926,8 +1250,9 @@ async function importRows() {
 
   let seen = 0;
   let imported = 0;
+  let sourceRefs = 0;
   let skipped = 0;
-  const pending: ImportRecord[] = [];
+  const pending: PendingImportRecord[] = [];
   for await (const line of reader) {
     if (!line.trim()) {
       continue;
@@ -943,21 +1268,31 @@ async function importRows() {
       continue;
     }
     pending.push({ row, product });
-    if (pending.length >= batchSize) {
-      await importBatch(conn, pending, batchId);
-      imported += pending.length;
-      if (imported % progressInterval === 0) {
-        console.error(`imported ${imported.toLocaleString()} rows`);
-      }
-      pending.length = 0;
+  }
+
+  const groups = canonicalGroups(pending);
+  for (const groupChunk of groupChunks(groups, batchSize)) {
+    const records = groupChunk.flatMap((group) => group.records);
+    await importBatch(conn, records, batchId);
+    imported += groupChunk.length;
+    sourceRefs += records.length;
+    if (sourceRefs % progressInterval === 0) {
+      console.error(
+        `imported ${imported.toLocaleString()} canonical rows and ${sourceRefs.toLocaleString()} source refs`,
+      );
     }
   }
-  if (pending.length > 0) {
-    await importBatch(conn, pending, batchId);
-    imported += pending.length;
-  }
   if (imported % progressInterval !== 0) {
-    console.error(`imported ${imported.toLocaleString()} rows`);
+    console.error(`imported ${imported.toLocaleString()} canonical rows and ${sourceRefs.toLocaleString()} source refs`);
+  }
+
+  const externalSourceRefs =
+    limit === 0 && sourceRefsInput !== input
+      ? await importSourceRefs(conn, sourceRefsInput, batchId, batchSize)
+      : { seen: 0, imported: 0, skipped: 0 };
+  if (externalSourceRefs.imported > 0) {
+    sourceRefs = externalSourceRefs.imported;
+    console.error(`imported ${sourceRefs.toLocaleString()} source refs from ${sourceRefsInput}`);
   }
 
   await conn.execute(
@@ -979,7 +1314,21 @@ async function importRows() {
     [batchId],
   );
 
-  console.log(JSON.stringify({ batchId, seen, imported, skipped, sample: sample.rows }, null, 2));
+  console.log(
+    JSON.stringify(
+      {
+        batchId,
+        seen,
+        imported,
+        sourceRefs,
+        duplicates: sourceRefs - imported,
+        skipped,
+        sample: sample.rows,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 await importRows();
