@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { relations } from "drizzle-orm";
 import { boolean, datetime, index, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 
@@ -8,7 +10,9 @@ export const user = mysqlTable(
   "user",
   {
     id: idColumn(),
-    publicId: varchar("public_id", { length: 32 }).notNull(),
+    publicId: varchar("public_id", { length: 32 })
+      .notNull()
+      .$defaultFn(() => randomUUID().replaceAll("-", "")),
     name: varchar("name", { length: 191 }).notNull().default(""),
     email: varchar("email", { length: 320 }).notNull(),
     emailVerified: boolean("email_verified").notNull().default(false),
