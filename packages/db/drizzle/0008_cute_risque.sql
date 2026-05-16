@@ -1,0 +1,1 @@
+ALTER TABLE `private_profiles` ADD `onboarding_answers` json;

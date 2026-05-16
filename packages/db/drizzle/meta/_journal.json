@@ -57,6 +57,13 @@
       "when": 1778764567389,
       "tag": "0007_overrated_speed",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1778928613386,
+      "tag": "0008_cute_risque",
+      "breakpoints": true
     }
   ]
 }
