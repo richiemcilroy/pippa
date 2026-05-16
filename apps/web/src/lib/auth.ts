@@ -3,7 +3,7 @@ import { getDatabase } from "@pippa/db";
 import * as schema from "@pippa/db/schema";
 import { betterAuth } from "better-auth";
 import { nextCookies } from "better-auth/next-js";
-import { emailOTP } from "better-auth/plugins";
+import { bearer, emailOTP } from "better-auth/plugins";
 import { after } from "next/server";
 
 import { sendAuthCodeEmail } from "./auth-email";
@@ -22,7 +22,21 @@ function createAuth() {
       protocol: "auto",
     },
     secret: env.betterAuthSecret,
-    trustedOrigins: ["http://localhost:3030", "https://pippa.health", "https://*.pippa.health"],
+    trustedOrigins: [
+      "http://localhost:3030",
+      "http://127.0.0.1:3030",
+      "http://localhost:8081",
+      "http://127.0.0.1:8081",
+      "http://localhost:19006",
+      "http://127.0.0.1:19006",
+      "https://pippa.health",
+      "https://*.pippa.health",
+      "https://*.vercel.app",
+    ],
+    session: {
+      expiresIn: 60 * 60 * 24 * 400,
+      updateAge: 60 * 60 * 24,
+    },
     database: drizzleAdapter(getDatabase(), {
       provider: "mysql",
       schema,
@@ -49,6 +63,7 @@ function createAuth() {
       max: 60,
     },
     plugins: [
+      bearer(),
       emailOTP({
         otpLength: 6,
         expiresIn: 300,
