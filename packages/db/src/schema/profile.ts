@@ -1,4 +1,5 @@
 import { relations } from "drizzle-orm";
+import type { OnboardingAnswers } from "@pippa/domain";
 import { date, datetime, index, int, json, mysqlTable, smallint, tinyint, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 
 import { user } from "./auth";
@@ -36,6 +37,7 @@ export const privateProfiles = mysqlTable(
       .$type<CalorieVisibilityMode>()
       .notNull()
       .default("visible"),
+    onboardingAnswers: json("onboarding_answers").$type<OnboardingAnswers>(),
     onboardingCompletedAt: datetime("onboarding_completed_at", { mode: "date", fsp: 3 }),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
